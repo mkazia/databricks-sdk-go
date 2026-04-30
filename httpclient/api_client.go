@@ -43,6 +43,17 @@ type ClientConfig struct {
 	TransientErrors []string
 
 	Transport http.RoundTripper
+
+	// ProxyAuthType selects the authentication scheme used against upstream
+	// HTTP(S) proxies. When empty, the SDK falls back to reading the
+	// DATABRICKS_PROXY_AUTH_TYPE environment variable. Supported values:
+	//   - ""           : no proxy auth beyond what is embedded in the proxy URL (default)
+	//   - "basic"      : HTTP Basic credentials supplied in the proxy URL (no-op, same as default)
+	//   - "negotiate"  : Kerberos SPNEGO (RFC 4559) using the user's Kerberos
+	//                    ticket cache located via KRB5CCNAME (or the system
+	//                    default) and krb5.conf located via KRB5_CONFIG (or
+	//                    /etc/krb5.conf).
+	ProxyAuthType string
 }
 
 type DoOption struct {
@@ -92,16 +103,50 @@ func makeDefaultTransport() *http.Transport {
 	}
 }
 
-func (cfg ClientConfig) httpTransport() http.RoundTripper {
+func (cfg ClientConfig) httpTransport() (http.RoundTripper, error) {
+	proxyAuth, err := resolveProxyAuthType(cfg.ProxyAuthType)
+	if err != nil {
+		return nil, err
+	}
+	needsKerberos := proxyAuth == proxyAuthNegotiate
+
 	if cfg.Transport != nil {
-		return cfg.Transport
+		if !needsKerberos {
+			return cfg.Transport, nil
+		}
+		ht, ok := cfg.Transport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("proxy auth type %q requires an *http.Transport; got %T", cfg.ProxyAuthType, cfg.Transport)
+		}
+		return withKerberosProxyAuth(ht.Clone()), nil
 	}
-	if cfg.InsecureSkipVerify {
-		t := makeDefaultTransport()
-		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		return t
+
+	// No caller-provided transport: pick a base, then attach Kerberos if needed.
+	// We cannot use the shared defaultTransport when Kerberos is on, because
+	// GetProxyConnectHeader is per-transport state.
+	var base *http.Transport
+	switch {
+	case cfg.InsecureSkipVerify:
+		base = makeDefaultTransport()
+		base.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	case needsKerberos:
+		base = makeDefaultTransport()
+	default:
+		return defaultTransport, nil
 	}
-	return defaultTransport
+	if needsKerberos {
+		return withKerberosProxyAuth(base), nil
+	}
+	return base, nil
+}
+
+// failingRoundTripper is used when transport construction fails at
+// [NewApiClient] time. It lets us defer the error to the first request so that
+// [NewApiClient] keeps its non-erroring signature.
+type failingRoundTripper struct{ err error }
+
+func (f failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, f.err
 }
 
 const (
@@ -135,7 +180,10 @@ func setDefaults(cfg *ClientConfig) {
 func NewApiClient(cfg ClientConfig) *ApiClient {
 	setDefaults(&cfg)
 
-	transport := cfg.httpTransport()
+	transport, err := cfg.httpTransport()
+	if err != nil {
+		transport = failingRoundTripper{err: err}
+	}
 	rateLimit := rate.Limit(cfg.RateLimitPerSecond)
 
 	// Depend on the HTTP fixture interface to prevent any coupling.
